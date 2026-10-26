@@ -1,0 +1,470 @@
+'use strict';
+const VERSI = '1.0.0';
+
+/* ---------- Database (IndexedDB) ---------- */
+let db;
+function bukaDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('katalog-karya-anak', 1);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      d.createObjectStore('anak', { keyPath: 'id' });
+      d.createObjectStore('karya', { keyPath: 'id' }).createIndex('anakId', 'anakId');
+      d.createObjectStore('meta', { keyPath: 'k' });
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function tx(store, mode, fn) {
+  return new Promise((res, rej) => {
+    const t = db.transaction(store, mode);
+    let out;
+    const rq = fn(t.objectStore(store));
+    if (rq) rq.onsuccess = () => { out = rq.result; };
+    t.oncomplete = () => res(out);
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error);
+  });
+}
+const semua = s => tx(s, 'readonly', o => o.getAll());
+const ambil = (s, id) => tx(s, 'readonly', o => o.get(id));
+const simpan = (s, v) => tx(s, 'readwrite', o => o.put(v));
+const hapus = (s, id) => tx(s, 'readwrite', o => o.delete(id));
+const getMeta = async k => { const r = await ambil('meta', k); return r ? r.v : undefined; };
+const setMeta = (k, v) => simpan('meta', { k, v });
+
+/* ---------- Alat bantu ---------- */
+const $ = s => document.querySelector(s);
+const esc = t => String(t == null ? '' : t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const hariIni = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const BULAN = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+function tglIndo(s) {
+  if (!s) return '';
+  const [y, m, d] = s.split('-').map(Number);
+  return `${d} ${BULAN[m - 1]} ${y}`;
+}
+function hitungUsia(lahir, tgl) {
+  if (!lahir || !tgl) return '';
+  const a = new Date(lahir + 'T00:00:00'), b = new Date(tgl + 'T00:00:00');
+  let bln = (b.getFullYear() - a.getFullYear()) * 12 + b.getMonth() - a.getMonth();
+  if (b.getDate() < a.getDate()) bln--;
+  if (bln < 0) return '';
+  const th = Math.floor(bln / 12), sisa = bln % 12;
+  if (th === 0) return `${sisa} bln`;
+  return sisa ? `${th} th ${sisa} bln` : `${th} th`;
+}
+let toastT;
+function toast(pesan) {
+  const t = $('#toast');
+  t.textContent = pesan;
+  t.classList.add('tampil');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => t.classList.remove('tampil'), 2600);
+}
+let urls = [];
+function urlBlob(b) { const u = URL.createObjectURL(b); urls.push(u); return u; }
+function bersihkanUrl() { urls.forEach(URL.revokeObjectURL); urls = []; }
+
+async function kompres(file, maks, mutu) {
+  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const r = Math.min(1, maks / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * r);
+  c.height = Math.round(bmp.height * r);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  if (bmp.close) bmp.close();
+  return new Promise(res => c.toBlob(res, 'image/jpeg', mutu));
+}
+const blobKeDataUrl = b => new Promise(res => { const f = new FileReader(); f.onload = () => res(f.result); f.readAsDataURL(b); });
+const dataUrlKeBlob = async u => (await fetch(u)).blob();
+
+function unduh(blob, nama) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = nama;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+/* ---------- Router ---------- */
+const main = () => $('#main');
+let renderId = 0;
+async function rute() {
+  const id = ++renderId;
+  bersihkanUrl();
+  const [r, a] = (location.hash.replace(/^#\/?/, '') || '').split('/');
+  document.querySelectorAll('#nav a').forEach(x => x.classList.toggle('on', x.dataset.r === (r || 'beranda')));
+  setJudul('Katalog Karya Anak');
+  try {
+    if (!r) await layarBeranda(id);
+    else if (r === 'anak' && a === 'baru') await layarFormAnak(id);
+    else if (r === 'anak') await layarAnak(id, a);
+    else if (r === 'tambah') await layarFormKarya(id, null, a);
+    else if (r === 'ubah') await layarFormKarya(id, a);
+    else if (r === 'karya') await layarDetail(id, a);
+    else if (r === 'cari') await layarCari(id);
+    else if (r === 'pengaturan') await layarPengaturan(id);
+    else location.hash = '#/';
+  } catch (e) {
+    console.error(e);
+    main().innerHTML = `<div class="kosong">Terjadi kesalahan: ${esc(e.message || e)}</div>`;
+  }
+  window.scrollTo(0, 0);
+}
+function setJudul(t, kembali) {
+  $('#bar').innerHTML = (kembali ? `<a href="${kembali}" aria-label="Kembali">&larr;</a>` : '') + `<h1 id="judul">${esc(t)}</h1>`;
+}
+window.addEventListener('hashchange', rute);
+
+/* ---------- Galeri ---------- */
+function htmlGrid(daftar, anakMap) {
+  if (!daftar.length) return '';
+  return `<div class="grid">${daftar.map(k => {
+    const u = urlBlob(k.thumb || k.foto);
+    const ket = k.judul || k.lokasi;
+    return `<a href="#/karya/${k.id}"><img src="${u}" alt="${esc(ket)}" loading="lazy"><span class="tag">${esc(ket)}</span></a>`;
+  }).join('')}</div>`;
+}
+const urutTerbaru = (a, b) => (b.tanggal || '').localeCompare(a.tanggal || '') || (b.dibuat || '').localeCompare(a.dibuat || '');
+
+/* ---------- Beranda ---------- */
+async function layarBeranda(id) {
+  const [anak, karya, eks, sejak] = await Promise.all([semua('anak'), semua('karya'), getMeta('eksporTerakhir'), getMeta('karyaSejakEkspor')]);
+  if (id !== renderId) return;
+  let h = '';
+  const hariLalu = eks ? (Date.now() - new Date(eks).getTime()) / 864e5 : null;
+  if (karya.length && ((sejak || 0) >= 10 || (hariLalu === null) || (hariLalu >= 30 && (sejak || 0) > 0))) {
+    h += `<div class="info">Data hanya ada di HP ini. ${eks ? 'Cadangan terakhir ' + tglIndo(eks.slice(0, 10)) + '.' : 'Belum pernah dicadangkan.'} <a href="#/pengaturan">Buat cadangan sekarang</a></div>`;
+  }
+  h += `<h2>Anak</h2>`;
+  if (!anak.length) {
+    h += `<div class="kosong">Belum ada anak.<br>Tambahkan dulu untuk mulai menyimpan karya.</div>`;
+  } else {
+    anak.sort((a, b) => a.nama.localeCompare(b.nama));
+    h += anak.map(a => {
+      const n = karya.filter(k => k.anakId === a.id).length;
+      return `<div class="kartu"><a class="anak-item" href="#/anak/${a.id}"><div class="avatar">${esc(a.nama.charAt(0).toUpperCase())}</div><div><strong>${esc(a.nama)}</strong><div class="redup">${n} karya${a.lahir ? ' · ' + hitungUsia(a.lahir, hariIni()) : ''}</div></div></a></div>`;
+    }).join('');
+  }
+  h += `<a class="tombol sekunder" href="#/anak/baru">+ Tambah anak</a>`;
+  const baru = karya.sort(urutTerbaru).slice(0, 6);
+  if (baru.length) h += `<h2>Karya terbaru</h2>` + htmlGrid(baru);
+  main().innerHTML = h;
+}
+
+/* ---------- Form anak ---------- */
+async function layarFormAnak(id) {
+  setJudul('Tambah anak', '#/');
+  main().innerHTML = `<form id="f">
+    <label>Nama</label><input id="nama" maxlength="40" required autocomplete="off">
+    <label>Tanggal lahir <small>(opsional, untuk menghitung usia)</small></label><input id="lahir" type="date">
+    <button class="penuh" type="submit">Simpan</button></form>`;
+  $('#f').onsubmit = async e => {
+    e.preventDefault();
+    const nama = $('#nama').value.trim();
+    if (!nama) return;
+    const ada = (await semua('anak')).some(a => a.nama.toLowerCase() === nama.toLowerCase());
+    if (ada) return toast('Nama itu sudah ada');
+    await simpan('anak', { id: uid(), nama, lahir: $('#lahir').value || null, dibuat: new Date().toISOString() });
+    toast('Anak disimpan');
+    location.hash = '#/';
+  };
+}
+
+/* ---------- Halaman anak ---------- */
+async function layarAnak(id, anakId) {
+  const a = await ambil('anak', anakId);
+  if (!a) { location.hash = '#/'; return; }
+  const karya = (await tx('karya', 'readonly', o => o.index('anakId').getAll(anakId))).sort(urutTerbaru);
+  if (id !== renderId) return;
+  setJudul(a.nama, '#/');
+  let h = `<div class="baris" style="margin-bottom:10px"><a class="tombol" href="#/tambah/${a.id}">+ Tambah karya</a></div>`;
+  h += karya.length ? htmlGrid(karya) : `<div class="kosong">Belum ada karya untuk ${esc(a.nama)}.</div>`;
+  h += `<h2>Data anak</h2><div class="kartu"><div class="redup">Lahir: ${a.lahir ? tglIndo(a.lahir) : '-'}</div>
+    <div class="baris" style="margin-top:10px"><button class="sekunder" id="ubahA">Ubah nama</button><button class="bahaya" id="hapusA">Hapus anak</button></div></div>`;
+  main().innerHTML = h;
+  $('#ubahA').onclick = async () => {
+    const n = prompt('Nama baru:', a.nama);
+    if (n && n.trim()) { a.nama = n.trim().slice(0, 40); await simpan('anak', a); rute(); }
+  };
+  $('#hapusA').onclick = async () => {
+    if (karya.length) return toast('Anak yang masih punya karya tidak bisa dihapus');
+    if (confirm(`Hapus ${a.nama}?`)) { await hapus('anak', a.id); location.hash = '#/'; }
+  };
+}
+
+/* ---------- Form karya (tambah dan ubah) ---------- */
+async function layarFormKarya(id, editId, anakAwal) {
+  const anak = await semua('anak');
+  if (id !== renderId) return;
+  if (!anak.length) {
+    setJudul('Tambah karya');
+    main().innerHTML = `<div class="kosong">Tambahkan anak dulu sebelum menyimpan karya.<br><br><a class="tombol" href="#/anak/baru">+ Tambah anak</a></div>`;
+    return;
+  }
+  const lama = editId ? await ambil('karya', editId) : null;
+  if (editId && !lama) { location.hash = '#/'; return; }
+  const semuaKarya = await semua('karya');
+  const lokasiSaran = [...new Set(semuaKarya.map(k => k.lokasi).filter(Boolean))];
+  const acaraSaran = [...new Set(semuaKarya.map(k => k.acara).filter(Boolean))];
+  const anakTerakhir = lama ? lama.anakId : (anakAwal || (await getMeta('anakTerakhir')) || anak[0].id);
+  setJudul(lama ? 'Ubah karya' : 'Tambah karya', lama ? '#/karya/' + lama.id : '#/');
+
+  const d = { foto: lama ? lama.foto : null, thumb: lama ? lama.thumb : null, tanggal: lama ? lama.tanggal : hariIni(), suara: lama ? [...(lama.suara || [])] : [] };
+
+  main().innerHTML = `<form id="f">
+    <div class="pilih-foto">
+      <button type="button" class="sekunder" id="bKamera">Foto dengan kamera</button>
+      <button type="button" class="sekunder" id="bGaleri">Pilih dari galeri</button>
+    </div>
+    <input type="file" id="fKamera" accept="image/*" capture="environment" hidden>
+    <input type="file" id="fGaleri" accept="image/*" hidden>
+    <img id="prev" alt="" ${d.foto ? `src="${urlBlob(d.foto)}"` : 'hidden'}>
+    <label>Anak</label>
+    <select id="anak">${anak.map(a => `<option value="${a.id}" ${a.id === anakTerakhir ? 'selected' : ''}>${esc(a.nama)}</option>`).join('')}</select>
+    <label>Lokasi <small>(nama tempat sehari-hari, misalnya Rumah nenek)</small></label>
+    <input id="lokasi" list="lokList" maxlength="80" autocomplete="off" required value="${esc(lama ? lama.lokasi : '')}">
+    <datalist id="lokList">${lokasiSaran.map(l => `<option value="${esc(l)}">`).join('')}</datalist>
+    <label>Judul <small>(opsional)</small></label>
+    <input id="judulK" maxlength="80" value="${esc(lama ? lama.judul : '')}">
+    <label>Cerita di balik karya <small>(opsional)</small></label>
+    <textarea id="cerita">${esc(lama ? lama.cerita : '')}</textarea>
+    <label>Rekaman suara cerita <small>(opsional)</small></label>
+    <div class="baris"><button type="button" class="sekunder" id="bRek">Mulai rekam</button><span id="rekStatus" class="redup"></span></div>
+    <div id="daftarSuara"></div>
+    <label>Acara <small>(opsional, misalnya Lomba 17 Agustus)</small></label>
+    <input id="acara" list="acrList" maxlength="80" autocomplete="off" value="${esc(lama ? lama.acara : '')}">
+    <datalist id="acrList">${acaraSaran.map(l => `<option value="${esc(l)}">`).join('')}</datalist>
+    <label>Isi gambar <small>(opsional, pisahkan dengan koma: rumah, kucing, pelangi)</small></label>
+    <input id="isi" maxlength="120" value="${esc(lama ? (lama.isi || []).join(', ') : '')}">
+    <label>Tanggal</label>
+    <input id="tanggal" type="date" value="${esc(d.tanggal)}" required>
+    <button class="penuh" type="submit" id="bSimpan">Simpan</button>
+  </form>`;
+
+  const pasangFoto = async file => {
+    if (!file) return;
+    try {
+      d.foto = await kompres(file, 1600, 0.85);
+      d.thumb = await kompres(file, 400, 0.8);
+      if (file.lastModified && file.name) d.tanggal = new Date(file.lastModified).toISOString().slice(0, 10);
+      if (!lama || !$('#tanggal').value) $('#tanggal').value = d.tanggal;
+      const p = $('#prev');
+      p.src = urlBlob(d.foto);
+      p.hidden = false;
+    } catch (e) { toast('Foto tidak bisa dibaca'); }
+  };
+  $('#bKamera').onclick = () => $('#fKamera').click();
+  $('#bGaleri').onclick = () => $('#fGaleri').click();
+  $('#fKamera').onchange = e => pasangFoto(e.target.files[0]);
+  $('#fGaleri').onchange = e => pasangFoto(e.target.files[0]);
+
+  const gambarSuara = () => {
+    $('#daftarSuara').innerHTML = d.suara.map((s, i) => `<div class="kartu"><audio controls src="${urlBlob(s)}"></audio><button type="button" class="bahaya" data-i="${i}" style="margin-top:8px">Hapus rekaman</button></div>`).join('');
+    $('#daftarSuara').querySelectorAll('button').forEach(b => b.onclick = () => { d.suara.splice(+b.dataset.i, 1); gambarSuara(); });
+  };
+  gambarSuara();
+
+  let rec = null, stream = null, chunks = [], timer = null, detik = 0;
+  $('#bRek').onclick = async () => {
+    if (rec) { rec.stop(); return; }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) { return toast('Izin mikrofon ditolak'); }
+    const tipe = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+    rec = tipe ? new MediaRecorder(stream, { mimeType: tipe }) : new MediaRecorder(stream);
+    chunks = [];
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    rec.onstop = () => {
+      clearInterval(timer);
+      stream.getTracks().forEach(t => t.stop());
+      d.suara.push(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }));
+      rec = null;
+      $('#bRek').textContent = 'Mulai rekam';
+      $('#rekStatus').textContent = '';
+      gambarSuara();
+    };
+    rec.start();
+    detik = 0;
+    $('#bRek').textContent = 'Berhenti';
+    $('#rekStatus').innerHTML = '<span class="rek">● Merekam 0:00</span>';
+    timer = setInterval(() => {
+      detik++;
+      $('#rekStatus').innerHTML = `<span class="rek">● Merekam ${Math.floor(detik / 60)}:${String(detik % 60).padStart(2, '0')}</span>`;
+      if (detik >= 300) rec.stop();
+    }, 1000);
+  };
+
+  $('#f').onsubmit = async e => {
+    e.preventDefault();
+    if (rec) return toast('Hentikan rekaman dulu');
+    if (!d.foto) return toast('Pilih atau ambil foto dulu');
+    const lokasi = $('#lokasi').value.trim();
+    if (!lokasi) return toast('Lokasi wajib diisi');
+    $('#bSimpan').disabled = true;
+    const rec2 = {
+      id: lama ? lama.id : uid(),
+      anakId: $('#anak').value,
+      foto: d.foto, thumb: d.thumb,
+      lokasi,
+      judul: $('#judulK').value.trim(),
+      cerita: $('#cerita').value.trim(),
+      acara: $('#acara').value.trim(),
+      isi: $('#isi').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+      tanggal: $('#tanggal').value || hariIni(),
+      suara: d.suara,
+      dibuat: lama ? lama.dibuat : new Date().toISOString(),
+      diubah: new Date().toISOString()
+    };
+    try {
+      await simpan('karya', rec2);
+      await setMeta('anakTerakhir', rec2.anakId);
+      if (!lama) await setMeta('karyaSejakEkspor', ((await getMeta('karyaSejakEkspor')) || 0) + 1);
+      if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+      toast('Karya disimpan');
+      location.hash = '#/karya/' + rec2.id;
+    } catch (err) {
+      $('#bSimpan').disabled = false;
+      toast('Gagal menyimpan: ' + (err && err.name === 'QuotaExceededError' ? 'penyimpanan penuh' : 'coba lagi'));
+    }
+  };
+}
+
+/* ---------- Detail karya ---------- */
+async function layarDetail(id, karyaId) {
+  const k = await ambil('karya', karyaId);
+  if (!k) { location.hash = '#/'; return; }
+  const a = await ambil('anak', k.anakId);
+  if (id !== renderId) return;
+  setJudul(k.judul || k.lokasi, a ? '#/anak/' + a.id : '#/');
+  const usia = a && a.lahir ? hitungUsia(a.lahir, k.tanggal) : '';
+  main().innerHTML = `<img class="foto-besar" src="${urlBlob(k.foto)}" alt="${esc(k.judul || k.lokasi)}">
+    <div class="kartu" style="margin-top:12px"><dl style="margin:0">
+      <dt>Anak</dt><dd>${esc(a ? a.nama : '-')}${usia ? ' · ' + usia : ''}</dd>
+      <dt>Lokasi</dt><dd>${esc(k.lokasi)}</dd>
+      <dt>Tanggal</dt><dd>${tglIndo(k.tanggal)}</dd>
+      ${k.acara ? `<dt>Acara</dt><dd>${esc(k.acara)}</dd>` : ''}
+      ${k.isi && k.isi.length ? `<dt>Isi gambar</dt><dd>${esc(k.isi.join(', '))}</dd>` : ''}
+      ${k.cerita ? `<dt>Cerita</dt><dd style="white-space:pre-wrap">${esc(k.cerita)}</dd>` : '<dt>Cerita</dt><dd class="redup">Belum ada cerita</dd>'}
+    </dl></div>
+    ${(k.suara || []).map(s => `<div class="kartu"><div class="redup">Rekaman cerita</div><audio controls src="${urlBlob(s)}"></audio></div>`).join('')}
+    <div class="baris" style="flex-wrap:wrap">
+      <a class="tombol" href="#/ubah/${k.id}">Ubah</a>
+      <button class="sekunder" id="bUnduh">Simpan foto</button>
+      <button class="bahaya" id="bHapus">Hapus</button>
+    </div>`;
+  $('#bUnduh').onclick = () => unduh(k.foto, `karya-${(a ? a.nama : 'anak').replace(/\W+/g, '-')}-${k.tanggal}.jpg`);
+  $('#bHapus').onclick = async () => {
+    if (confirm('Hapus karya ini beserta ceritanya?')) { await hapus('karya', k.id); toast('Karya dihapus'); location.hash = a ? '#/anak/' + a.id : '#/'; }
+  };
+}
+
+/* ---------- Pencarian ---------- */
+async function layarCari(id) {
+  const [anak, karya] = await Promise.all([semua('anak'), semua('karya')]);
+  if (id !== renderId) return;
+  setJudul('Cari karya');
+  const lokasi = [...new Set(karya.map(k => k.lokasi).filter(Boolean))].sort();
+  const acara = [...new Set(karya.map(k => k.acara).filter(Boolean))].sort();
+  main().innerHTML = `<input id="q" type="search" placeholder="Cari lokasi, acara, isi gambar, cerita" autocomplete="off">
+    <label>Anak</label>
+    <select id="fa"><option value="">Semua anak</option>${anak.map(a => `<option value="${a.id}">${esc(a.nama)}</option>`).join('')}</select>
+    ${lokasi.length ? `<h2>Lokasi</h2><div class="chips" id="cLok">${lokasi.map(l => `<button type="button" class="chip" data-v="${esc(l)}">${esc(l)}</button>`).join('')}</div>` : ''}
+    ${acara.length ? `<h2>Acara</h2><div class="chips" id="cAcr">${acara.map(l => `<button type="button" class="chip" data-v="${esc(l)}">${esc(l)}</button>`).join('')}</div>` : ''}
+    <h2 id="hasilJudul">Semua karya</h2><div id="hasil"></div>`;
+  let fLok = '', fAcr = '';
+  const tampil = () => {
+    bersihkanUrl();
+    const q = $('#q').value.trim().toLowerCase(), fa = $('#fa').value;
+    const hasil = karya.filter(k => {
+      if (fa && k.anakId !== fa) return false;
+      if (fLok && k.lokasi !== fLok) return false;
+      if (fAcr && k.acara !== fAcr) return false;
+      if (!q) return true;
+      const gudang = [k.lokasi, k.acara, k.judul, k.cerita, (k.isi || []).join(' ')].join(' ').toLowerCase();
+      return q.split(/\s+/).every(w => gudang.includes(w));
+    }).sort(urutTerbaru);
+    $('#hasilJudul').textContent = `${hasil.length} karya ditemukan`;
+    $('#hasil').innerHTML = hasil.length ? htmlGrid(hasil) : '<div class="kosong">Tidak ada karya yang cocok.</div>';
+  };
+  const pasangChip = (el, set) => el && el.querySelectorAll('.chip').forEach(c => c.onclick = () => {
+    const aktif = c.classList.contains('on');
+    el.querySelectorAll('.chip').forEach(x => x.classList.remove('on'));
+    if (!aktif) c.classList.add('on');
+    set(aktif ? '' : c.dataset.v);
+    tampil();
+  });
+  pasangChip($('#cLok'), v => { fLok = v; });
+  pasangChip($('#cAcr'), v => { fAcr = v; });
+  $('#q').oninput = tampil;
+  $('#fa').onchange = tampil;
+  tampil();
+}
+
+/* ---------- Cadangan ---------- */
+async function layarPengaturan(id) {
+  const [anak, karya, eks] = await Promise.all([semua('anak'), semua('karya'), getMeta('eksporTerakhir')]);
+  if (id !== renderId) return;
+  setJudul('Cadangan');
+  let ruang = '';
+  if (navigator.storage && navigator.storage.estimate) {
+    const e = await navigator.storage.estimate();
+    ruang = `${(e.usage / 1048576).toFixed(1)} MB terpakai`;
+  }
+  const permanen = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : false;
+  main().innerHTML = `<div class="kartu"><strong>${anak.length}</strong> anak, <strong>${karya.length}</strong> karya<div class="redup">${ruang}</div>
+    <div class="redup">Cadangan terakhir: ${eks ? tglIndo(eks.slice(0, 10)) : 'belum pernah'}</div>
+    <div class="redup">Penyimpanan permanen: ${permanen ? 'aktif' : 'belum diizinkan browser'}</div></div>
+    <div class="info">Semua data hanya tersimpan di browser HP ini. Kalau data browser dihapus atau HP hilang, data ikut hilang. Buat cadangan secara berkala dan simpan file-nya di tempat lain (Google Drive, laptop).</div>
+    <button class="penuh" id="bEks">Ekspor cadangan</button>
+    <h2>Pulihkan dari cadangan</h2>
+    <p class="redup">Data di file akan digabung dengan data yang ada. Tidak ada data yang dihapus.</p>
+    <button class="sekunder penuh" id="bImp">Pilih file cadangan</button>
+    <input type="file" id="fImp" accept=".json,application/json" hidden>
+    <p class="redup" style="margin-top:24px">Katalog Karya Anak v${VERSI}</p>`;
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+  $('#bEks').onclick = async () => {
+    $('#bEks').disabled = true;
+    try {
+      const out = { aplikasi: 'katalog-karya-anak', format: 1, dibuat: new Date().toISOString(), anak: await semua('anak'), karya: [] };
+      for (const k of await semua('karya')) {
+        out.karya.push({ ...k, foto: await blobKeDataUrl(k.foto), thumb: k.thumb ? await blobKeDataUrl(k.thumb) : null, suara: await Promise.all((k.suara || []).map(blobKeDataUrl)) });
+      }
+      unduh(new Blob([JSON.stringify(out)], { type: 'application/json' }), `cadangan-karya-anak-${hariIni()}.json`);
+      await setMeta('eksporTerakhir', new Date().toISOString());
+      await setMeta('karyaSejakEkspor', 0);
+      toast('Cadangan dibuat');
+      rute();
+    } catch (e) { toast('Gagal membuat cadangan'); $('#bEks').disabled = false; }
+  };
+  $('#bImp').onclick = () => $('#fImp').click();
+  $('#fImp').onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const data = JSON.parse(await f.text());
+      if (data.aplikasi !== 'katalog-karya-anak') throw new Error('bukan file cadangan aplikasi ini');
+      let nA = 0, nK = 0;
+      for (const a of data.anak) { if (!(await ambil('anak', a.id))) nA++; await simpan('anak', a); }
+      for (const k of data.karya) {
+        const ada = await ambil('karya', k.id);
+        if (ada && (ada.diubah || '') >= (k.diubah || '')) continue;
+        if (!ada) nK++;
+        await simpan('karya', { ...k, foto: await dataUrlKeBlob(k.foto), thumb: k.thumb ? await dataUrlKeBlob(k.thumb) : null, suara: await Promise.all((k.suara || []).map(dataUrlKeBlob)) });
+      }
+      toast(`Dipulihkan: ${nA} anak, ${nK} karya baru`);
+      rute();
+    } catch (err) { toast('File tidak bisa dibaca: ' + err.message); }
+  };
+}
+
+/* ---------- Mulai ---------- */
+(async function mulai() {
+  try { db = await bukaDB(); } catch (e) { main().innerHTML = '<div class="kosong">Penyimpanan browser tidak tersedia. Jangan pakai mode samaran.</div>'; return; }
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  rute();
+})();
